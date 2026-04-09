@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: car-rental-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+    autoDeploy: true
+    plan: free
