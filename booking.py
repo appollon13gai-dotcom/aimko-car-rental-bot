@@ -17,6 +17,31 @@ BOOKING_URL_TEMPLATE = (
     "?new=true&brand={brand}"
 )
 
+# Mapping of location names → Select2 option values on hqrentals.eu
+LOCATION_VALUES = {
+    "Aeropuerto Barcelona":    "1",
+    "Aeropuerto de Girona":    "3",
+    "Badalona":                "5",
+    "Barcelona Sants":         "4",
+    "Blanes":                  "12",
+    "Calella":                 "9",
+    "El Masnou":               "6",
+    "Empuriabrava":            "20",
+    "Lloret de Mar":           "2",
+    "L'Escala":                "19",
+    "Malgrat de Mar":          "11",
+    "Mataró":                  "8",
+    "Palamos":                 "18",
+    "Pineda de Mar":           "10",
+    "Platja d'Aro":            "16",
+    "Premiá de Mar":           "7",
+    "Roses":                   "21",
+    "Sant Antoni de Calonge":  "17",
+    "Sant Feliu de Guixols":   "14",
+    "S'Agaro":                 "15",
+    "Tossa de Mar":            "13",
+}
+
 
 class CarRentalBooking:
     """Управляет сессией бронирования автомобиля."""
@@ -74,36 +99,74 @@ class CarRentalBooking:
             return match.group(1)
         return None
 
-    async def _select_location(self, page: Page, button_text_pattern: str, location_name: str):
-        """
-        Выбираем локацию из выпадающего списка.
-        button_text_pattern: 'Pickup Location' или 'Return Location'
-        """
-        try:
-            # Кликаем на кнопку выпадающего списка
-            await page.get_by_role("button", name=re.compile(button_text_pattern, re.I)).first.click()
-            await page.wait_for_timeout(500)
+    async def _set_field(self, page: Page, field_id: str, value: str):
+        """Очищаем поле и вводим значение по ID."""
+        locator = page.locator(f"#{field_id}")
+        await locator.click(timeout=5000)
+        await locator.triple_click(timeout=5000)
+        await locator.fill(value)
+        await page.keyboard.press("Tab")
+        await page.wait_for_timeout(200)
 
-            # Ищем вариант в выпадающем списке и кликаем
-            option = page.get_by_text(location_name, exact=True).first
-            await option.wait_for(state="visible", timeout=5000)
-            await option.click()
-            await page.wait_for_timeout(300)
+    async def _select_location(self, page: Page, select_id: str, location_name: str):
+        """
+        Выбираем локацию через Select2.
+        select_id: 'pick_up_location' или 'return_location'
+        """
+        # Находим числовой value по имени локации
+        value = LOCATION_VALUES.get(location_name)
+        if not value:
+            # Нечёткий поиск если точного совпадения нет
+            for name, val in LOCATION_VALUES.items():
+                if location_name.lower() in name.lower() or name.lower() in location_name.lower():
+                    value = val
+                    logger.info(f"Нечёткое совпадение локации: '{location_name}' → '{name}' (value={val})")
+                    break
+
+        if not value:
+            logger.error(f"Локация не найдена: '{location_name}'")
+            return
+
+        try:
+            # Устанавливаем значение через jQuery Select2 API
+            await page.evaluate(f"""
+                (function() {{
+                    var sel = document.getElementById('{select_id}');
+                    if (sel) {{
+                        sel.value = '{value}';
+                        // Trigger jQuery change event for Select2
+                        if (window.jQuery) {{
+                            jQuery(sel).trigger('change');
+                        }} else {{
+                            sel.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        }}
+                    }}
+                }})();
+            """)
+            await page.wait_for_timeout(400)
+            logger.info(f"Локация '{location_name}' (value={value}) установлена в #{select_id}")
         except Exception as e:
-            logger.warning(f"Ошибка выбора локации '{location_name}': {e}")
-            # Запасной метод: через select если есть
-            try:
-                selects = page.locator("select")
-                count = await selects.count()
-                for i in range(count):
-                    sel = selects.nth(i)
-                    options = await sel.locator("option").all_text_contents()
-                    for opt in options:
-                        if location_name.lower() in opt.lower():
-                            await sel.select_option(label=opt)
-                            break
-            except Exception as e2:
-                logger.error(f"Не удалось выбрать локацию: {e2}")
+            logger.error(f"Ошибка установки локации '{location_name}': {e}")
+
+    async def _fill_step1(self, page: Page, booking_data: dict):
+        """Заполняем шаг 1: даты, времена, локации."""
+        # Заполняем дату получения
+        await self._set_field(page, "pick_up_date", booking_data["pickup_date"])
+
+        # Заполняем время получения
+        await self._set_field(page, "pick_up_time", booking_data["pickup_time"])
+
+        # Заполняем дату возврата
+        await self._set_field(page, "return_date", booking_data["return_date"])
+
+        # Заполняем время возврата
+        await self._set_field(page, "return_time", booking_data["return_time"])
+
+        # Выбираем локации через Select2
+        await self._select_location(page, "pick_up_location", booking_data["pickup_location"])
+        await self._select_location(page, "return_location", booking_data["return_location"])
+
+        await page.wait_for_timeout(300)
 
     # ────────────────────────────────────────────────────────────────
     # Публичный API
@@ -119,51 +182,20 @@ class CarRentalBooking:
         try:
             # ── Шаг 1: Даты и локации ──────────────────────────────
             start_url = BOOKING_URL_TEMPLATE.format(base=self.base_url, brand=self.brand)
-            await page.goto(start_url, wait_until="networkidle", timeout=30000)
+            await page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(1500)
 
             # Сохраняем ssid
             self.ssid = await self._extract_ssid(page)
             logger.info(f"SSID сессии: {self.ssid}")
 
-            # Заполняем дату получения
-            pickup_date_field = page.locator("input[placeholder='dd-mm-yyyy']").first
-            await pickup_date_field.click()
-            await pickup_date_field.fill(booking_data["pickup_date"])
-            await page.keyboard.press("Tab")
-            await page.wait_for_timeout(300)
-
-            # Заполняем время получения
-            pickup_time_field = page.locator("input[placeholder*='Time'], input[placeholder*='time']").first
-            await pickup_time_field.click()
-            await pickup_time_field.fill(booking_data["pickup_time"])
-            await page.keyboard.press("Tab")
-            await page.wait_for_timeout(300)
-
-            # Заполняем дату возврата
-            return_date_fields = page.locator("input[placeholder='dd-mm-yyyy']")
-            await return_date_fields.nth(1).click()
-            await return_date_fields.nth(1).fill(booking_data["return_date"])
-            await page.keyboard.press("Tab")
-            await page.wait_for_timeout(300)
-
-            # Заполняем время возврата
-            time_fields = page.locator("input[placeholder*='Time'], input[placeholder*='time']")
-            await time_fields.nth(1).click()
-            await time_fields.nth(1).fill(booking_data["return_time"])
-            await page.keyboard.press("Tab")
-            await page.wait_for_timeout(300)
-
-            # Выбираем локации через dropdown
-            await self._select_location(page, "Pickup Location", booking_data["pickup_location"])
-            await page.wait_for_timeout(500)
-            await self._select_location(page, "Return Location", booking_data["return_location"])
-            await page.wait_for_timeout(500)
+            # Заполняем все поля шага 1
+            await self._fill_step1(page, booking_data)
 
             # Кликаем "Next Step"
-            next_btn = page.get_by_role("button", name=re.compile("next step", re.I))
-            await next_btn.click()
-            await page.wait_for_load_state("networkidle", timeout=20000)
+            next_btn = page.locator("button.btn-primary, button[type='submit'], input[type='submit']").last
+            await next_btn.click(timeout=10000)
+            await page.wait_for_load_state("domcontentloaded", timeout=25000)
             await page.wait_for_timeout(2000)
 
             # ── Шаг 2: Список автомобилей ──────────────────────────
@@ -186,26 +218,24 @@ class CarRentalBooking:
         """Парсим список доступных автомобилей со страницы шага 2."""
         cars = []
         try:
-            # Ждём появления карточек авто
-            await page.wait_for_selector(
-                ".vehicle-item, .car-item, .vehicle-card, [class*='vehicle'], [class*='car-card']",
-                timeout=10000,
-            )
-        except PWTimeout:
-            logger.warning("Карточки авто не найдены стандартным селектором, пробую альтернативные...")
+            # Ждём появления карточек авто — несколько вариантов селекторов
+            try:
+                await page.wait_for_selector(
+                    ".vehicle-item, .car-item, .vehicle-card, [class*='vehicle'], "
+                    "[class*='car-card'], table tbody tr, .panel",
+                    timeout=12000,
+                )
+            except PWTimeout:
+                logger.warning("Стандартные карточки авто не найдены, продолжаем парсинг...")
 
-        try:
-            # Универсальный парсинг — ищем карточки с именем авто и ценой
-            content = await page.content()
-
-            # Пробуем получить через JavaScript все карточки авто
+            # Получаем через JavaScript все карточки авто
             car_data = await page.evaluate("""() => {
                 const results = [];
 
                 // Вариант 1: карточки vehicle
                 const vehicleCards = document.querySelectorAll(
                     '.vehicle-item, .vehicle-card, .car-item, .car-card, ' +
-                    '[data-vehicle-id], [data-car-id], .vehicle'
+                    '[data-vehicle-id], [data-car-id], .vehicle, .panel-body'
                 );
 
                 vehicleCards.forEach((card, idx) => {
@@ -238,22 +268,25 @@ class CarRentalBooking:
                     }
                 });
 
-                // Вариант 2: если ничего не нашли, ищем строки таблицы
+                // Вариант 2: строки таблицы
                 if (results.length === 0) {
-                    const rows = document.querySelectorAll('tr, .row[class*="vehicle"], .vehicle-row');
+                    const rows = document.querySelectorAll('table tbody tr');
                     rows.forEach((row, idx) => {
                         const cells = row.querySelectorAll('td');
                         if (cells.length >= 2) {
                             const priceEl = row.querySelector('[class*="price"]');
-                            results.push({
-                                name: cells[0] ? cells[0].textContent.trim() : `Auto ${idx+1}`,
-                                price: priceEl ? priceEl.textContent.trim().replace(/[^\\d.,]/g, '') :
-                                       (cells[cells.length-1] ? cells[cells.length-1].textContent.trim() : 'N/A'),
-                                price_raw: priceEl ? priceEl.textContent.trim() : '',
-                                category: cells[1] ? cells[1].textContent.trim() : '',
-                                image: '',
-                                idx: idx,
-                            });
+                            const nameText = cells[0] ? cells[0].textContent.trim() : '';
+                            if (nameText && nameText.length > 1) {
+                                results.push({
+                                    name: nameText,
+                                    price: priceEl ? priceEl.textContent.trim().replace(/[^\\d.,]/g, '') :
+                                           (cells[cells.length-1] ? cells[cells.length-1].textContent.trim() : 'N/A'),
+                                    price_raw: priceEl ? priceEl.textContent.trim() : '',
+                                    category: cells[1] ? cells[1].textContent.trim() : '',
+                                    image: '',
+                                    idx: idx,
+                                });
+                            }
                         }
                     });
                 }
@@ -262,7 +295,6 @@ class CarRentalBooking:
             }""")
 
             if car_data and len(car_data) > 0:
-                # Очищаем данные
                 for car in car_data:
                     name = car.get("name", "").strip()
                     if name and len(name) > 1 and name.lower() not in ["select", "book", "next"]:
@@ -288,14 +320,19 @@ class CarRentalBooking:
                 if key not in seen and len(key) > 2:
                     seen.add(key)
                     unique_cars.append(car)
-            cars = unique_cars[:15]  # максимум 15 авто
+            cars = unique_cars[:15]
 
         except Exception as e:
             logger.error(f"Ошибка парсинга авто: {e}", exc_info=True)
 
-        # Если всё равно ничего не нашли — fallback данные для теста
         if not cars:
             logger.warning("Авто не найдены через парсинг — возможно изменилась структура страницы")
+            # Сделаем скриншот для диагностики
+            try:
+                await page.screenshot(path="/tmp/debug_step2.png")
+                logger.info("Скриншот сохранён в /tmp/debug_step2.png")
+            except Exception:
+                pass
 
         return cars
 
@@ -303,7 +340,6 @@ class CarRentalBooking:
         """
         Проходим все шаги бронирования:
         Step 1 → Step 2 (выбор авто) → Step 3 (extras) → Step 4 (клиент) → Step 5 (confirm)
-        Возвращает {"success": bool, "booking_id": str, "error": str}
         """
         page = await self._launch()
         result = {"success": False, "booking_id": None, "error": None}
@@ -311,39 +347,15 @@ class CarRentalBooking:
         try:
             # ── Шаг 1: Даты и локации ──────────────────────────────
             start_url = BOOKING_URL_TEMPLATE.format(base=self.base_url, brand=self.brand)
-            await page.goto(start_url, wait_until="networkidle", timeout=30000)
+            await page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(1500)
 
-            # Дата получения
-            await page.locator("input[placeholder='dd-mm-yyyy']").first.fill(booking_data["pickup_date"])
-            await page.keyboard.press("Tab")
-            await page.wait_for_timeout(200)
-
-            # Время получения
-            time_inputs = page.locator("input[placeholder*='ime']")
-            await time_inputs.first.fill(booking_data["pickup_time"])
-            await page.keyboard.press("Tab")
-            await page.wait_for_timeout(200)
-
-            # Дата возврата
-            await page.locator("input[placeholder='dd-mm-yyyy']").nth(1).fill(booking_data["return_date"])
-            await page.keyboard.press("Tab")
-            await page.wait_for_timeout(200)
-
-            # Время возврата
-            await time_inputs.nth(1).fill(booking_data["return_time"])
-            await page.keyboard.press("Tab")
-            await page.wait_for_timeout(200)
-
-            # Локации
-            await self._select_location(page, "Pickup Location", booking_data["pickup_location"])
-            await page.wait_for_timeout(400)
-            await self._select_location(page, "Return Location", booking_data["return_location"])
-            await page.wait_for_timeout(400)
+            await self._fill_step1(page, booking_data)
 
             # Следующий шаг
-            await page.get_by_role("button", name=re.compile("next step", re.I)).click()
-            await page.wait_for_load_state("networkidle", timeout=20000)
+            next_btn = page.locator("button.btn-primary, button[type='submit'], input[type='submit']").last
+            await next_btn.click(timeout=10000)
+            await page.wait_for_load_state("domcontentloaded", timeout=25000)
             await page.wait_for_timeout(2000)
             logger.info(f"Step 2 URL: {page.url}")
 
@@ -354,13 +366,13 @@ class CarRentalBooking:
                 result["error"] = "Не удалось выбрать автомобиль на шаге 2"
                 return result
 
-            await page.wait_for_load_state("networkidle", timeout=20000)
+            await page.wait_for_load_state("domcontentloaded", timeout=20000)
             await page.wait_for_timeout(2000)
             logger.info(f"Step 3 URL: {page.url}")
 
             # ── Шаг 3: Доп. опции (extras) — просто Next ───────────
             await self._click_next(page)
-            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
             await page.wait_for_timeout(1500)
             logger.info(f"Step 4 URL: {page.url}")
 
@@ -371,7 +383,7 @@ class CarRentalBooking:
                 return result
 
             await self._click_next(page)
-            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
             await page.wait_for_timeout(2000)
             logger.info(f"Step 5 URL: {page.url}")
 
@@ -381,7 +393,6 @@ class CarRentalBooking:
                 result["success"] = True
                 result["booking_id"] = booking_id
             else:
-                # Всё равно считаем успехом если добрались до шага 5/6
                 if "step5" in page.url or "step6" in page.url or "confirm" in page.url or "payment" in page.url:
                     result["success"] = True
                     result["booking_id"] = await self._extract_ssid(page) or "CONFIRMED"
@@ -422,11 +433,10 @@ class CarRentalBooking:
                 return True
 
             # Последний вариант: кликаем на карточку авто напрямую
-            cards = page.locator(".vehicle-item, .vehicle-card, .car-card, [data-vehicle-id]")
+            cards = page.locator(".vehicle-item, .vehicle-card, .car-card, [data-vehicle-id], .panel")
             card_count = await cards.count()
             if card_count > 0:
                 idx = min(car_idx, card_count - 1)
-                # Ищем кнопку внутри карточки
                 btn = cards.nth(idx).get_by_role("button").first
                 await btn.click()
                 return True
@@ -439,12 +449,9 @@ class CarRentalBooking:
     async def _fill_customer_form(self, page: Page, data: dict) -> bool:
         """Заполняем форму клиента на шаге 4."""
         try:
-            # Ждём поля ввода
             await page.wait_for_selector("input[type='text'], input[type='email'], input[type='tel']", timeout=8000)
 
-            # Заполняем поля по имени/placeholder/type
             field_mappings = [
-                # (паттерн для name/placeholder/id, значение)
                 (r"first.?name|fname|given.?name|nombre", data["first_name"]),
                 (r"last.?name|lname|surname|apellido", data["last_name"]),
                 (r"email|e-mail|correo", data["email"]),
@@ -458,13 +465,11 @@ class CarRentalBooking:
                 else:
                     logger.warning(f"Поле '{pattern}' не найдено")
 
-            # Пробуем заполнить поля по порядку если специфичные не нашлись
             all_text_inputs = page.locator("input[type='text']:visible, input[type='email']:visible, input[type='tel']:visible")
             count = await all_text_inputs.count()
             logger.info(f"Всего полей ввода на шаге 4: {count}")
 
             if count >= 2:
-                # Проверяем что имя/фамилия заполнены
                 for i in range(min(count, 6)):
                     field = all_text_inputs.nth(i)
                     current_val = await field.input_value()
@@ -491,7 +496,6 @@ class CarRentalBooking:
     async def _fill_field_by_pattern(self, page: Page, pattern: str, value: str) -> bool:
         """Заполняем поле по паттерну в name/placeholder/id."""
         try:
-            # Через JS находим нужное поле
             filled = await page.evaluate(f"""(args) => {{
                 const pattern = new RegExp(args.pattern, 'i');
                 const inputs = document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], input:not([type="hidden"]):not([type="submit"]):not([type="checkbox"])');
@@ -513,7 +517,6 @@ class CarRentalBooking:
     async def _click_next(self, page: Page):
         """Кликаем кнопку следующего шага."""
         try:
-            # Пробуем разные варианты кнопки
             for selector in [
                 "button[type='submit']",
                 "input[type='submit']",
@@ -532,14 +535,11 @@ class CarRentalBooking:
     async def _confirm_and_get_id(self, page: Page) -> Optional[str]:
         """Кликаем подтверждение на шаге 5 и получаем номер бронирования."""
         try:
-            # Кликаем финальную кнопку подтверждения
             await self._click_next(page)
-            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
             await page.wait_for_timeout(2000)
 
-            # Ищем номер бронирования на странице
             booking_id = await page.evaluate("""() => {
-                // Ищем текст с номером бронирования
                 const patterns = [
                     /booking.*?[#:]?\\s*([A-Z0-9-]{4,})/i,
                     /reservation.*?[#:]?\\s*([A-Z0-9-]{4,})/i,
@@ -554,7 +554,6 @@ class CarRentalBooking:
                     if (match) return match[1];
                 }
 
-                // Ищем в специфичных элементах
                 const idEl = document.querySelector(
                     '[class*="booking-id"], [class*="confirmation"], [class*="reference"], ' +
                     '[id*="booking"], [id*="confirmation"]'
@@ -568,7 +567,6 @@ class CarRentalBooking:
                 logger.info(f"Номер бронирования: {booking_id}")
                 return booking_id
 
-            # Если не нашли — используем ssid как идентификатор
             ssid = await self._extract_ssid(page)
             return ssid
 

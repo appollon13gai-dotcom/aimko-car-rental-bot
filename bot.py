@@ -276,11 +276,35 @@ async def return_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         )
         return RETURN_TIME
 
-    # Показываем что делаем запрос
-    loading_msg = await update.message.reply_text(
-        "⏳ Ищу доступные автомобили... Пожалуйста, подождите.",
+    # Убираем клавиатуру и показываем статус загрузки
+    # Важно: сначала убираем клавиатуру, потом отправляем loading (который можно редактировать)
+    await update.message.reply_text(
+        "⏳ Начинаю поиск автомобилей...",
         reply_markup=ReplyKeyboardRemove(),
     )
+    loading_msg = await update.message.reply_text(
+        "🔍 Ищу доступные автомобили на выбранные даты. Пожалуйста, подождите (30–60 секунд)..."
+    )
+
+    chat_id = update.effective_chat.id
+
+    async def safe_update_msg(text: str, reply_markup=None, parse_mode=None):
+        """Обновляем сообщение или отправляем новое если редактирование не работает."""
+        try:
+            kwargs = {"text": text}
+            if reply_markup:
+                kwargs["reply_markup"] = reply_markup
+            if parse_mode:
+                kwargs["parse_mode"] = parse_mode
+            await loading_msg.edit_text(**kwargs)
+        except Exception:
+            # Если edit не работает — отправляем новое сообщение
+            kwargs = {"chat_id": chat_id, "text": text}
+            if reply_markup:
+                kwargs["reply_markup"] = reply_markup
+            if parse_mode:
+                kwargs["parse_mode"] = parse_mode
+            await context.bot.send_message(**kwargs)
 
     # Получаем список доступных авто через Playwright
     try:
@@ -290,7 +314,7 @@ async def return_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         context.user_data["booking_session"] = booking.ssid
 
         if not cars:
-            await loading_msg.edit_text(
+            await safe_update_msg(
                 "😔 К сожалению, на выбранные даты нет доступных автомобилей.\n"
                 "Попробуйте изменить даты или локации. Введите /start для новой попытки."
             )
@@ -315,15 +339,15 @@ async def return_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
         buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
-        await loading_msg.edit_text(
+        await safe_update_msg(
             text_cars + "\nВыберите автомобиль:",
-            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
         )
 
     except Exception as e:
-        logger.error(f"Ошибка при получении авто: {e}")
-        await loading_msg.edit_text(
+        logger.error(f"Ошибка при получении авто: {e}", exc_info=True)
+        await safe_update_msg(
             "❌ Произошла ошибка при загрузке автомобилей. Попробуйте снова /start"
         )
         return ConversationHandler.END
